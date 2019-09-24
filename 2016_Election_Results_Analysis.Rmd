@@ -1,0 +1,1370 @@
+---
+title: "Final Project (PSTAT 231)"
+author: "Modjtaba Shokrian Zini (9398611), Glen Frost (8477861)"
+date: "3/20/2019"
+output: html_document
+---
+
+
+```{r cache=TRUE, setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r cache=TRUE, message = FALSE , echo=FALSE, warning=FALSE}
+# You might need to install the following packages.
+# install.packages('kableExtra')
+# install.packages('corrgram')
+# install.packages('xtable')
+library(xtable)
+library(kableExtra)
+library(corrgram)
+```
+
+```{r cache=TRUE,message = FALSE , echo=FALSE, warning=FALSE}
+library(tidyverse)
+library(ROCR)
+library(tree)
+library(maptree)
+library(class)
+library(lattice)
+library(ggridges)
+library(superheat)
+library(glmnet)
+```
+
+```{r cache=TRUE,message = FALSE , echo=FALSE, warning=FALSE}
+ election.raw = read.csv("data/election/election.csv") %>% as.tbl
+ census_meta = read.csv("data/census/metadata.csv", sep = ";") %>% as.tbl
+ census = read.csv("data/census/census.csv") %>% as.tbl
+```
+
+
+#1- Background
+
+
+
+    What makes voter behavior prediction (and thus election forecasting) a hard problem?
+    
+  It is unknown precisely how a voter determines their personal vote.  Humans can make irrational decisions and vote based on emotions, which can be hard to predict.  Geopolitical events are highly unpredictable and the news media can frame the events in different ways to influence voters.  The concept of an October surprise captures this idea: "a news event deliberately created or timed or sometimes occurring spontaneously to influence the outcome of an election" (source: Wikipedia)
+
+    What was unique to Nate Silver’s approach in 2012 that allowed him to achieve good predictions?
+    
+  Silver constructs a model that uses high quality polls from bigger state races such as Florida to augment scarcity of polls in smaller races such as Montana.  Data from previous elections allows him to weigh the information appropriately.  The polls were more reliable during 2012 and didn't change much over time, which makes time series models (a classical tool in voting prediction) more effective.
+
+    What went wrong in 2016? What do you think should be done to make future predictions better?
+    
+One of the biggest changes in 2016 is the rise of social media.  Facebook is reaching its peak and implements a news portal to provide news to users without leaving the site, as well as algorithms to filter out misleading content.  The filter relies on users to report content and train the algorithm.  Combined together these Facebook features create a "filter bubble" where content the user disagrees with  are suppressed.
+
+Another factor is unreliability of polls.  There is a large proportion of undecided voters in this election due to the unpopularity of both candidates.  Nate Silver in his tweets on election day admits that this is causing prediction errors.  Also voters are reluctant to admit support for Trump, leading to polls skewed toward Clinton.
+
+Our analysis below shows that Trump wins by the narrowest of margins: less than 100,000 votes in a few counties.  With many voters remaining exactly on the fence on election day, this results in highly unstable predictions.  In order to make better predictions in the future we would want to obtain more data.
+
+#2- Data Wrangling
+
+4) Before we begin we must clean the data.  Alaska has a fips value of 2000, so the rows where `fips=2000` are indeed state-level summary of election results. However, the state-level summary rows of Alaska are already available when we read the data, so it makes no sense to have duplicate records.  We remove the counties with `fips=2000` from `election.raw`. The dimension of election.raw is `18345 x 5`.
+
+```{r, cache=TRUE, echo=FALSE, message=FALSE}
+election.raw <- election.raw[election.raw$fips!="2000",]
+#dim(election.raw)
+```
+
+
+5) We build dataframes `election_federal` and `election_state` which contains summary information at the federal and state levels.
+
+```{r cache=TRUE, echo=FALSE, message=FALSE}
+election_federal <- election.raw[election.raw$fips=="US",]
+election_state <- election.raw[election.raw$fips %in% state.abb,]
+election <- election.raw[!(election.raw$fips %in% state.abb),]
+election <- election[!(election$fips=="US"),]
+```
+
+6) We have the following candidates in the election:
+
+```{r, cache=TRUE, echo = FALSE, message = FALSE}
+#kable(levels(election$candidate))
+kable(levels(election$candidate), "html",col.names = "Candidates")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "200px") 
+```
+
+There are 32 candidates, but the candidate " None of these candidates" is not a named candidate.
+Hence there are 31 named candidates.
+We plot the vote count per candidates with a log scale:
+
+```{r, cache=TRUE, message = FALSE, echo = FALSE}
+#bar chart of all votes received by each candidate (log scale)
+
+ggplot(data=select(filter(election_federal,state=='US'),c("candidate","votes")), aes(x=candidate,y=votes)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  scale_y_log10() +
+  labs(title = "Vote Count for Candidates (log scaled)")
+
+```
+
+
+7) We create new variables `county_winner` and `state_winner` by taking the candidate with the highest proportion of votes.
+
+```{r cache=TRUE, echo = FALSE, message = FALSE}
+county_winner <- election %>% group_by(fips) %>% add_tally(votes)
+colnames(county_winner)[6] <- "total"
+county_winner <- county_winner %>% mutate(pct=votes/total) %>% group_by(fips) %>%  top_n(n=1,wt=pct)
+
+
+state_winner <- election_state %>% group_by(fips) %>% add_tally(votes)
+colnames(state_winner)[6] <- "total"
+state_winner <- state_winner %>% mutate(pct=votes/total) %>% group_by(fips) %>%  top_n(n=1,wt=pct)
+```
+
+__Datasets to be used for future__
+
+We also build dataframes storing the county and state results for three of the main four candidates Hillary Clinton, Donald Trump, Gary Johnson (and Jill Stein), in order to predict votes in the further exploration section. We only focus  on three of the four main candidates (excluding Jill Stein), as they determine the votes of the last one pretty well. 
+
+```{r, cache=TRUE, message = FALSE , echo=FALSE, warning=FALSE}
+my.county_results <-  election %>% group_by(fips) %>% add_tally(votes)
+colnames(my.county_results)[6] <- "total"
+my.county_results<- my.county_results %>% mutate(pct=votes/total) 
+my.county_results_restricted <-
+  my.county_results[my.county_results$candidate %in%
+                                                    c("Hillary Clinton","Donald Trump",
+                                                      "Gary Johnson"),]
+#Results per state:
+my.state_results <- election_state %>% group_by(fips) %>% add_tally(votes)
+colnames(my.state_results)[6] <- "total"
+my.state_results <- my.state_results %>% mutate(pct=votes/total) %>% select(-county) 
+my.state_results_restricted <-
+  my.state_results[my.state_results$candidate %in%
+                                                  c("Hillary Clinton", "Donald Trump",
+                                                    "Gary Johnson"),]
+```
+
+#3- Visualization
+
+Visualizing the state map:
+
+```{r cache=TRUE,message = FALSE , echo=FALSE, warning=FALSE}
+states <- map_data("state")
+ggplot(data = states) + 
+  geom_polygon(aes(x = long, y = lat, fill = region, group = group),
+               color = "white") + coord_fixed(1.3) + guides(fill=FALSE)+labs(title="State map")
+```
+
+
+8) Visualizing the county map:
+
+```{r cache=TRUE,message = FALSE , echo=FALSE, warning=FALSE}
+counties <-  map_data("county")
+ ggplot(data = counties) + 
+   geom_polygon(aes(x = long, y = lat, fill = subregion, group = group),
+                color = "white") + coord_fixed(1.3) + guides(fill=FALSE)+labs(title="County map")
+```
+
+9) Coloring the map for the winning candidate:
+
+```{r cache=TRUE,message = FALSE , echo=FALSE, warning=FALSE}
+fips = state.abb[match(states$region, tolower(state.name))]
+states <-  states %>% mutate(fips=fips)
+states$fips <- as.factor(states$fips)
+states <- left_join(states,state_winner[c("fips","candidate")],by="fips")
+ggplot(data = states) +
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group),
+               color = "white")+coord_fixed(1.3)+guides(fill=FALSE)+labs(title="State winner map")
+```
+
+10) Visualizing the county map according to the winner:
+
+```{r cache=TRUE,message = FALSE , echo=FALSE, warning=FALSE}
+newcountyfips <- maps::county.fips %>%
+  separate(polyname,into=c("region","subregion"),sep=",")
+counties <- left_join(counties,newcountyfips,by=c("region","subregion"))
+#converting factor to integer for county_winner
+counties$fips <- as.factor(counties$fips)
+counties <- left_join(counties,county_winner[c("fips","candidate")],by="fips")
+ggplot(data = counties) +
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group),
+               color = "white")+coord_fixed(1.3)+guides(fill=FALSE)+labs(title="County winner map")
+```
+
+11) Answered after 13).
+
+12) We build `census.del` (see .Rmd file). We also delete the `Women` column as it is determined be `Man`.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+census.del <- census[complete.cases(census),]
+census.del <- census.del %>%  mutate(Men=(Men/TotalPop)) %>%
+  mutate(Employed=(Employed/TotalPop)) %>%
+  mutate(Citizen=(Citizen/TotalPop))
+census.del <- census.del %>% select(-c("Walk", "PublicWork", "Construction"))
+census.del <- census.del %>% mutate(Minority=Hispanic+Black+Native+Asian+Pacific)
+census.del <- census.del %>% select(-c("Hispanic","Black","Native","Asian","Pacific"))
+```
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+census.del <- census.del %>%  select(-"Women")
+```
+
+We also build `census.subct` and `census.ct` as instructed and we print the first few rows of `census.ct`.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+census.subct <- census.del %>%  group_by(State,County) %>% add_tally(wt=TotalPop)
+colnames(census.subct)[29] <- "CountyTotal"
+census.subct <- census.subct %>% mutate(weight=TotalPop/CountyTotal)
+```
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+census.ct <-
+  summarise_at(census.subct,.vars=vars(Men:CountyTotal),
+               .funs=funs(weighted.mean(.,weight)))
+kable(census.ct %>% head, "html")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+
+
+13) I was in California, Santa Barbara County. To compare the county against the state, we need to summarise census and build a `census.s` dataframe similar to `census.ct`.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+census.s.pre <- census.ct %>% group_by(State) %>% add_tally(wt=CountyTotal)
+colnames(census.s.pre)[29] <- "StateTotal"
+census.s.pre <- census.s.pre %>% mutate(weight=CountyTotal/StateTotal)
+census.s.pre <- census.s.pre %>% select(-CountyTotal)
+census.s <-
+  summarise_at(group_by(.data=census.s.pre,State),.vars=vars(Men:StateTotal),
+               .funs=funs(weighted.mean(.,weight)))
+kable(census.s %>% head, "html")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+
+Now let us compare the two by looking at their percentage difference across variables:
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+my_county_stats <- census.ct[census.ct$County=="Santa Barbara",3:27]
+my_state_stats <- census.s[census.s$State=="California",2:26]
+kable(((my_county_stats-my_state_stats)/my_state_stats)*100 %>% head, "html")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+
+We see a significant more population of `White` ($20\%$ more) and hence less `Minority`. We see a slighlty higher `Income` and a lesser `Poverty` and `ChildPoverty` rate of about ($7-8\%$). So we may have a more affluent county compared to state's average. We see also a lot less unemployment by about 18%. We see far less people using public `Transit` and more people working in `Service` and also perhaps in `Construction` (which does not appear here but can be calculated). We see also a large $52\%$ compared to the state in unpaid `FamilyWork`.
+
+
+11) The census data is (not completely tidy and) more fine-grained than even county level, which makes it hard to visualize it on a map. Hence we will perform the visualization using the modified census versions. We first build a county map dataframe with all the census data combined.
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+my.counties.map <- counties
+tmpcensus.counties <- ungroup(census.ct) %>% mutate_at(vars(State, County), tolower)
+#normalizing Hillary=0 and Trump to 1
+my.counties.map$candidate=factor(my.counties.map$candidate,
+                                 levels=c("Donald Trump","Hillary Clinton"))
+colnames(my.counties.map)[c(5,6)]=c("State","County")
+my.counties.map <- my.counties.map %>%
+  left_join(tmpcensus.counties,by = c("State","County")) %>% na.omit
+
+```
+
+Visualization of `White/Minority` influence on the county result: We simply multiply the `White` percentage by the result. The blue counties are __exactly__ the ones that went to Hillary. Any other county went to Trump, and the more purple to blue it is, it means that although there were a significant minority, the county still went to Trump. We observe a lot of purple to almost blue counties on the west (southwest,west coast, and northwest) that went to trump.
+
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+library(munsell)
+cl <- mnsl(c("5B 7/8", "5R 7/10"))
+ggplot(data = my.counties.map) +
+  geom_polygon(aes(x = long, y = lat, fill = (1-as.numeric(candidate)/2)*White/100,
+                   group = group),color = "white")+
+  scale_fill_gradient(low = cl[1],high = cl[2])+
+  coord_fixed(1.3)+guides(fill=FALSE)+labs(title="Minority influence")
+```
+
+We also visualize the `Minority` and `Income`. We observe that higher minority is correlated with lesser income. Higher minority also means a higher likelihood for Hillary winning.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+ggplot(data = my.counties.map,aes(x = Minority, y = Income)) +
+  geom_smooth()+geom_point()+labs(title="Minority vs Income in counties")
+```
+
+We see a more uniform distribution for the income per capita of Hillary voters than that of Donald Trump. His is more like a Gaussian distribution. And a `geom_boxplot` also shows that generally, if a county has gone to Trump then its income per capita is lower than a county that has gone for Hillary.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+ggplot(data = my.counties.map) +
+  geom_violin(aes(x = candidate, y = IncomePerCap))+labs(title="Income per Capita of counties won by each candidate")
+```
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+ggplot(data = my.counties.map) +
+  geom_boxplot(aes(x = candidate, y = IncomePerCap))+labs(title="Income per Capita of counties won by each candidate")
+```
+
+A rural county generally goes to Trump. We can see this by looking at the county population (log-scaled) plot below.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+ggplot(data = my.counties.map) +
+  geom_boxplot(aes(x = candidate, y = log(CountyTotal)))+labs(title="log-population of counties won by each candidate")
+```
+
+Focusing on the decisive Blue Wall states (will be talked about later), we visualize which candidate won the richer/poorer counties in each of these states:
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+ggplot(data = my.counties.map[my.counties.map$State %in%
+                                c("wisconsin","pennsylvania","michigan"),])+
+  geom_boxplot(aes(x = candidate, y = IncomePerCap))+labs(title="Income per capita of counties in Blue Wall states")
+```
+
+We see an even larger difference in these three states, compared to the same plot for all states. 
+
+#4- Dimensionality reduction
+
+14) We perform PCA on `census.ct` and `census.ct`.  We choose to scale and center the features because if some features have large variance and some small, then PCA will decide that the features with large variance will explain all variation in the data.
+
+```{r, cache=TRUE, message=FALSE, echo=FALSE}
+#run PCA on 'census.subct' and 'census.ct'
+subct.pca <- prcomp(select(ungroup(census.subct),-c("State","County")), scale = TRUE, center = TRUE)
+ct.pca <- prcomp(select(ungroup(census.ct),-c("State","County")), scale = TRUE, center = TRUE)
+```
+
+```{r, cache=TRUE, message=FALSE, echo=FALSE}
+#save first two PC components from each into 2-column data frames 'ct.pc' and 'subct.pca'
+ct.pc <- tibble(PC1=ct.pca$x[,1], PC2=ct.pca$x[,2])
+subct.pc <- tibble(PC1=subct.pca$x[,1], PC2=subct.pca$x[,2])
+```
+
+The features of `census.ct` with the largest absolute values of the first principal component are
+
+```{r, message=FALSE, echo=FALSE}
+#computes the features with the largest absolute values of the first principal component
+#kable(order(ct.pca$rotation[,1],decreasing=T)[1:3])
+tmp <- order(ct.pca$rotation[,1],decreasing=T)[1:3]
+kable(colnames(census.ct)[tmp],col.names = "Features")
+```
+
+The features of `census.subct` with the largest absolute values of the first principal component are 
+
+```{r, message=FALSE, echo=FALSE}
+#doing this for the subct.pca
+#order(subct.pca$rotation[,1],decreasing=T)[1:3]
+#order(subct.pca$rotation[,1],decreasing=T)[1:3]
+
+tmp <- order(subct.pca$rotation[,1],decreasing=T)[1:3]
+kable(colnames(census.subct)[tmp],col.names = "Features")
+```
+
+
+15) We plot the PVE and cumulative PVE for the `census.ct` PCA:
+
+```{r, cache=TRUE, message=FALSE, echo=FALSE}
+ct.pca.var = ct.pca$sdev^2         #compute pca variance
+ct.pve <- ct.pca.var/sum(ct.pca.var)  #compute pve
+ct.cumulative_pve <- cumsum(ct.pve)#compute cumulative pve
+
+## This will put the next two plots side by side    
+par(mfrow=c(1, 2))
+
+## Plot proportion of variance explained
+plot(ct.pve, type="l", lwd=3)
+plot(ct.cumulative_pve, type="l", lwd=3)
+```
+
+The number of PCs which capture 90% of the variance is 13.
+
+```{r, cache=TRUE, message=FALSE, echo=FALSE, include=FALSE}
+#find number of PCs to capture 90% of variance
+length(ct.cumulative_pve[ct.cumulative_pve<0.9])
+```
+
+We plot the PVE and cumulative PVE for the `census.subct` PCA:
+
+```{r, cache=TRUE, message=FALSE, echo=FALSE}
+# pve and cumpve for subct
+subct.pca.var = subct.pca$sdev^2         #compute pca variance
+subct.pve <- subct.pca.var/sum(subct.pca.var)  #compute pve
+subct.cumulative_pve <- cumsum(subct.pve)#compute cumulative pve
+
+## This will put the next two plots side by side    
+par(mfrow=c(1, 2))
+
+## Plot proportion of variance explained
+plot(subct.pve, type="l", lwd=3)
+plot(subct.cumulative_pve, type="l", lwd=3)
+```
+
+The number of PCs for `subct` which capture 90% of the variance is 16.
+
+```{r, cache=TRUE, message=FALSE, echo=FALSE, include=FALSE}
+#find number of PCs to capture 90% of variance
+length(subct.cumulative_pve[subct.cumulative_pve<0.9])
+```
+
+#5- Clustering
+
+16) We perform hierarchical clustering on `census.ct` with complete linkage and cut to 10 clusters.  We do the same instead using the first five principal components.
+
+```{r, cache=TRUE, message=FALSE, echo=FALSE, warning=FALSE}
+#hierarchical clustering with complete linkage on census.ct, followed by a cut
+ct.hclust <- hclust(dist(census.ct), method="complete")
+ct.hclust.cut <- cutree(ct.hclust,k=10)
+
+#hierarchical clustering with complete linkage on census.ct, followed by a cut
+pc5.ct.hclust <- hclust(dist(ct.pca$x[,1:5]),method="complete")
+pc5.ct.hclust.cut <- cutree(pc5.ct.hclust,k=10)
+```
+
+ We want to know which clustering is more appropriate for San Mateo county.  San Mateo county went to Clinton.  In order to determine which cluster is more appropriate, we will see which cluster has a higher percentage of Clinton.
+
+The following table is the count of Clinton/Trump in the cluster with San Mateo county of the clustering on all of `census.ct`:
+
+```{r,cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+labels1 = which(ct.hclust.cut == ct.hclust.cut[census.ct$County=="San Mateo"])
+counties1 <- census.ct[labels1,]$County
+counties1 <-as.factor(paste(as.character(counties1),"County"))
+tmp <- county_winner[county_winner$county %in% counties1,] %>% group_by(candidate) %>% count()
+kable(tmp %>% head, "html", col.names = c("Candidate","Count"), caption = "count of Clinton/Trump in the cluster with San Mateo county of the full clustering")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+
+```
+
+The following table is the count of Clinton/Trump in the cluster with San Mateo county of the clustering on first five principal components of `census.ct`:
+
+```{r,cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+labels2 = which(pc5.ct.hclust.cut == pc5.ct.hclust.cut[census.ct$County=="San Mateo"])
+counties2 <- census.ct[labels2,]$County
+counties2 <-as.factor(paste(as.character(counties2),"County"))
+tmp <- county_winner[county_winner$county %in% counties2,] %>% group_by(candidate) %>% count()
+kable(tmp %>% head, "html", col.names = c("Candidate","Count"), caption = "count of Clinton/Trump in the cluster with San Mateo county of the PC5 clustering")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+
+```
+ 
+The clustering with the first five principal components is more appropriate since the proportion of Hillary is higher than in the other cluster.
+
+#6- Classification
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+tmpwinner <- county_winner %>% ungroup %>%
+  mutate(state = state.name[match(state, state.abb)]) %>%
+  mutate_at(vars(state, county), tolower) %>%  
+  mutate(county = gsub(" county| columbia| city| parish", "", county))
+tmpcensus <- ungroup(census.ct) %>% mutate_at(vars(State, County), tolower)
+election.cl <- tmpwinner %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+election.meta <- election.cl %>% select(c(county, fips, state, votes, pct, total))
+election.cl = election.cl %>% select(-c(county, fips, state, votes, pct, total))
+```
+
+On top of the data that is defined by the handout given by combining `county_winner` and `census` datas, we also build data frames on the winner of the election at county levels and the results of each county and state for each of the three main candidates. These dataframes will be used in __Further Exploration__ part and Question 21.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+my.winner.election.cl <- tmpwinner %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+```
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+#(restricted to 3 candidates) votes for states for future use
+tmpresults.s <- my.state_results_restricted %>% ungroup %>%
+  mutate(state = state.name[match(state, state.abb)])
+my.election.restricted.sl <- tmpresults.s %>%
+  left_join(census.s, by = c("state"="State")) %>% 
+  na.omit
+#(restricted to 3 candidates) votes for counties for future use
+tmpresults.cl <- my.county_results_restricted %>% ungroup %>%
+  mutate(state = state.name[match(state, state.abb)]) %>%
+  mutate_at(vars(state, county), tolower) %>%
+  mutate(county = gsub(" county| columbia| city| parish", "", county))
+tmpcensus <- ungroup(census.ct) %>% mutate_at(vars(State, County), tolower)
+my.election.restricted.cl <- tmpresults.cl %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+```
+
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+#partition data into 80% training and 20% testing 
+set.seed(10) 
+n <- nrow(election.cl)
+in.trn <- sample.int(n, 0.8*n) 
+trn.cl <- election.cl[ in.trn,]
+tst.cl <- election.cl[-in.trn,]
+#  define 10 cross validation folds
+set.seed(20) 
+nfold <- 10
+folds <- sample(cut(1:nrow(trn.cl), breaks=nfold, labels=FALSE))
+```
+
+Further for future usage, we define our version of train-test partitioning and folds for the county and state results for the three main candidates. 
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+#For county we first do a spreading 
+#votes are same information as `pct` and `pct` are better for glm as they are between 0 to 1 already
+set.seed(10) 
+my.election.restricted.cl <- my.election.restricted.cl %>% select(-pct) %>% spread(key=candidate,value=votes)
+my.n.cl <- nrow(my.election.restricted.cl)
+my.in.trn.cl <- sample.int(my.n.cl, 0.8*my.n.cl) 
+my.trn.cl <- my.election.restricted.cl[ my.in.trn.cl,]
+my.tst.cl <- my.election.restricted.cl[-my.in.trn.cl,]
+set.seed(20) 
+nfold <- 10
+my.folds.cl <- sample(cut(1:nrow(my.trn.cl), breaks=nfold, labels=FALSE))
+
+#For state level there are not that many observations while there are many variables; So we will train on the whole dataset; that being said, we shall still define them for possible future use
+my.election.restricted.sl <- my.election.restricted.sl %>% select(-pct) %>% spread(key=candidate,value=votes)
+my.n.sl <- nrow(my.election.restricted.sl)
+my.in.trn.sl <- sample.int(my.n.sl, 0.95*my.n.sl) 
+my.trn.sl <- my.election.restricted.sl[ my.in.trn.sl,]
+my.tst.sl <- my.election.restricted.sl[-my.in.trn.sl,]
+#folds for county and states
+set.seed(20)
+my.folds.sl <- sample(cut(1:nrow(my.trn.sl), breaks=nfold, labels=FALSE))
+```
+
+Finally, we will also use the `records` and `calc_error_rate` functions provided by the handout. 
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+calc_error_rate = function(predicted.value, true.value){
+  return(mean(true.value!=predicted.value))
+}
+records = matrix(NA, nrow=3, ncol=2)
+colnames(records) = c("train.error","test.error")
+rownames(records) = c("tree","logistic","lasso")
+```
+
+17) Decision tree: We first define the `tree.control` parameters and apply `tree()` on the training data set to obtain the following tree.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+tree_parameters = tree.control(nobs=nrow(trn.cl), minsize=10, mindev=1e-3)
+trn.cl.tree = tree(candidate~., data = trn.cl,
+                control = tree_parameters)
+```
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+draw.tree(trn.cl.tree, nodeinfo=TRUE,cex=.4)
+```
+
+We use then `cv.tree` to do 10-fold cross validation with `FUN=prune.misclass`. We then take the best tree size and apply pruning with `method="misclass"` and visualize the pruned tree. We see that the best tree size is $8$.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+trn.cl.cv.tree = cv.tree(trn.cl.tree, rand=folds,FUN=prune.misclass, K=nfold)
+
+best.trn.cl.cv.tree.size <- 
+  min(trn.cl.cv.tree$size[which(trn.cl.cv.tree$dev==min(trn.cl.cv.tree$dev))])
+kable(best.trn.cl.cv.tree.size,col.names = "best tree size", "html")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+pruned.trn.cl <- prune.tree(trn.cl.tree, best=best.trn.cl.cv.tree.size,method="misclass")
+draw.tree(pruned.trn.cl, nodeinfo=TRUE, cex=.4)
+```
+
+
+Intepret and discuss the results of the decision tree analysis. Use this plot to tell a story about voting behavior in the US
+
+__ANSWER__: Discussion of the results:
+
+Interesting enough, the first variable used for classification is `Transit`, which is the $\%$ commuting on public transportation. If it is higher than only about $1\%$ percent, then it is indicative of a county that has a high probability of going to Hillary Clinton. This makes sense as people living in cities and urban areas use a lot more public transportation than the people in rural areas which overwhelmingly voted for Trump. Then we have the split done by `White` percentage and the county population. More white goes to Trump and more population (county being an urban area) goes to Hillary. Higher income rural white people seems to have voted more for Hillary. The people in urban counties with more professional jobs voted for Hillary but those who were with lower employment went for Trump (which is a finding supported by other studies: https://www.nytimes.com/2016/12/13/business/economy/jobs-economy-voters.html )
+
+We next perform the predictions and calculate the error rates and record them in `records`.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+train.tree.predict <- predict(pruned.trn.cl,
+                              newdata = trn.cl,
+                              type = "class"
+                              )
+test.tree.predict <- predict(pruned.trn.cl,
+                             newdata = tst.cl,
+                             type = "class"
+                             )
+tree.train.error.rate <- calc_error_rate(train.tree.predict, trn.cl$candidate)
+tree.test.error.rate <- calc_error_rate(test.tree.predict, tst.cl$candidate)
+
+records[1,]=c(tree.train.error.rate,tree.test.error.rate)
+kable(records, "html")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+18) We do the glm fit and will calculate all errors by majority rule (threshold $0.5$). We print a summary; we observe that the significant variables are (ignore the `intercept`):
+
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+glm_out <- glm(candidate ~ . , family=binomial('logit'), data=trn.cl)
+
+kable(xtable(summary(glm_out)), "html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+```{r,message = FALSE, echo=FALSE, warning=FALSE}
+# kable(summary(glm_out))
+significant_variables_glm <- as.data.frame(summary(glm_out)$coefficients[-1,4]<0.05)
+kable(rownames(significant_variables_glm)[significant_variables_glm==TRUE],col.names = "Significant Variables", "html")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height  = "100%")
+```
+<!-- What are the significant variables? Are these consistent with what you observed in the decision tree analysis? Interpret the meaning of a couple of the significant coefficients in terms of a unit change in the variables.  -->
+<!-- __ANSWER__: -->
+
+They are not exactly same with what we saw in decision tree case. `Transit` or `CountyTotal` or `Income` is not there, but `Employed` and `White` and `Professional` are there. In addition, it seems glm uses more of the employment specific data by considering all of the specific types of jobs. On the other hand, since `Drive` and `Carpool` are among glm most significant variables, it looks like glm is also paying attention to these variables like decision tree did to `Transit`.
+
+A unit change (one percent) in `Professional` gives a multiplicative change of $e^{0.2471}=1.28030714$ in the odds (in favor of Hillary Clinton), for `Production` it is $e^{0.1575}=1.17058076$, and in `Drive` it is $e^{-0.1857}=0.830522714$. 
+
+We perform the predictions and store the errors inside records.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+train.glm.error.response <- predict(glm_out,type="response") 
+test.glm.error.response <- predict(glm_out,tst.cl,type="response")
+
+#applying majority rule
+train.glm.error=ifelse(train.glm.error.response > 0.5, "Hillary Clinton", "Donald Trump") 
+test.glm.error=ifelse(test.glm.error.response > 0.5, "Hillary Clinton", "Donald Trump")
+train.glm.error.rate=calc_error_rate(train.glm.error,trn.cl$candidate)
+test.glm.error.rate=calc_error_rate(test.glm.error,tst.cl$candidate)
+records[2,]=c(train.glm.error.rate,test.glm.error.rate)
+kable(records, "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+As we can see the model decision tree is performing best so far.
+
+<!-- Did your particular county (from question 13) results match the predicted results? -->
+
+My county has **unique** population $432687$ and it can be found only in `tst.cl`. So we check glm response to be higher than $0.5$ to account for Hillary Clinton and be a true prediction. The prediction turns out to be correct.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+kable(test.glm.error.response[tst.cl$CountyTotal==432687] > 0.5, caption="Hillary Clinton", col.names = "Santa Barbara", "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+19) Before doing glmnet we need to make sure to refactor the candidate levels to only two levels and put the dataframe into a matrix (which means we also forgo the candiate column). After applying `cv.glmnet` we get the best value of lambda with minimum misclassification error which is
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+glmnet_out <- cv.glmnet(x=as.matrix(select(trn.cl,-candidate)),
+                        y=factor(trn.cl$candidate,c("Donald Trump", "Hillary Clinton")),
+                        nfolds = nfold,alpha=1,foldid = folds,family="binomial",
+                        type.measure="class")
+```
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+kable(glmnet_out$lambda.min,col.names = "best lambda value", "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+
+<!-- What are the non-zero coefficients in the LASSO regression for the optimal value of $\lambda$? How do they compare to the unpenalized logistic regression? Save training and test errors to the records variable -->
+
+We see with the exception of `ChildPoverty`, `SelfEmployed` and `Minority`, other coefficients are nonzero.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+coefficients_best_lambda <- coef(glmnet_out, s = "lambda.min")
+kable(as.matrix(coefficients_best_lambda),col.names = "Coefficients", "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+As to how they compare to glm, we see coefficients being generally smaller, as it should be since we are penalizing their norm. But we also see a bigger coefficient for `Transit` and `CountyTotal`, the two variables that glm was not taking as significant in contrast to decision tree.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+kable(as.matrix((coef(glmnet_out, s = "lambda.min")-coef(glm_out))/coef(glm_out)),col.names = "Percentage difference of glmnet vs glm" ,"html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+We perform the predictions and store them in records
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+train.glmnet.error.response <-
+  predict(glmnet_out,newx=as.matrix(select(trn.cl,-candidate)),type="response",
+          s="lambda.min") 
+test.glmnet.error.response <-
+  predict(glmnet_out,newx=as.matrix(select(tst.cl,-candidate)),type="response",
+          s="lambda.min") 
+
+train.glmnet.error=
+  ifelse(train.glmnet.error.response > 0.5, "Hillary Clinton", "Donald Trump") 
+test.glmnet.error=
+  ifelse(test.glmnet.error.response > 0.5, "Hillary Clinton", "Donald Trump")
+train.glmnet.error.rate=calc_error_rate(train.glmnet.error,trn.cl$candidate)
+test.glmnet.error.rate=calc_error_rate(test.glmnet.error,tst.cl$candidate)
+records[3,]=c(train.glmnet.error.rate,test.glmnet.error.rate)
+
+kable(records, "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+20) Plotting the ROC curves:
+
+```{r , cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+#making sure to have continuous variable to avoid warning/errors in prediction
+tst.cl.candidate=ifelse(tst.cl$candidate=="Hillary Clinton",1,0) 
+#for the tree model
+test.tree.error.response <- predict(pruned.trn.cl,
+                             newdata = tst.cl,type="vector")
+pred.tree <- prediction(test.tree.error.response[,c("Hillary Clinton")], tst.cl.candidate)
+perf.tree <- performance(pred.tree, "tpr", "fpr")
+#similarly for the glm model
+pred.glm <- prediction(test.glm.error.response,tst.cl.candidate)
+perf.glm <- performance(pred.glm, "tpr", "fpr")
+#similarly for the glmnet model
+pred.glmnet <- prediction(test.glmnet.error.response,tst.cl.candidate)
+perf.glmnet <- performance(pred.glmnet, "tpr", "fpr")
+colorsmodels <- c('red', 'blue','green')
+plot(perf.glm,col=colorsmodels[1])
+plot(perf.tree, add = TRUE,col=colorsmodels[2])
+plot(perf.glmnet,add=TRUE,col=colorsmodels[3])
+legend("bottom", 
+  legend = c("glm", "tree", "glmnet"),col = colorsmodels,inset = c(0.1, 0.1),bty = "n",pch = c(20,20,20))
+```
+
+And here is the colorized with threshold guide.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+plot(perf.glm,colorize=TRUE)
+plot(perf.tree, add = TRUE,colorize=TRUE)
+plot(perf.glmnet,add=TRUE,colorize=TRUE)
+```
+
+Computing the AUCs:
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+auc.tree.tmp <- performance(pred.tree,"auc")
+auc.tree <- as.numeric(auc.tree.tmp@y.values)
+auc.glm.tmp <- performance(pred.glm,"auc")
+auc.glm <- as.numeric(auc.glm.tmp@y.values)
+auc.glmnet.tmp <- performance(pred.glmnet,"auc")
+auc.glmnet <- as.numeric(auc.glmnet.tmp@y.values)
+kable(c("tree"=auc.tree,"glm"=auc.glm,"LASSO"=auc.glmnet), col.names = "AUC values","html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+By AUC metric, we see that glm and glmnet are doing better than tree. To compare all models let us review their errors at the same time. 
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+kable(records, "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+We should be careful that the threshold chosen for logistic and lasso were set to $0.5$ and by AUC score, it looks like better values can be chosen to lower the train and test error. But sometimes it would be better to choose a model depending on the question.
+
+For example, if the question is generally asking about whether for a county with (variable $X >$ some threshold), we can predict with good accuracy a result, then decision tree performs better; esp. if that variable is something like `Transit`. 
+
+If we want to know how a combination of variables influence the result it would be better to consult the glm and glmnet models. Also, we can choose which one among the two to consult by looking at their coefficients. So for example if we want to know how `Transit`, `CountyTotal` and `IncomeErr` together influence the result it would be better to choose glmnet instead of glm. Or if we want to know how `ChildPoverty` and `Minority` influence the result it would be better to consult glm as glmnet completely ignores these two.
+
+ 
+It is important to note that for the general election prediction, one needs to have a good look at how these models perfom at the electoral level. Then, perhaps we could make a decision as to which model could be the best model when it comes to the most important (winner) prediction.
+
+21) We store the errors of the lasso prediction with the dataset containing the fips. This will make it easy to merge with counties.
+
+```{r cache=TRUE,message = FALSE, echo=FALSE, warning=FALSE}
+my.winner.election.cl$prediction=0
+my.winner.election.cl$prediction[in.trn]=train.glmnet.error
+my.winner.election.cl$prediction[-in.trn]=test.glmnet.error
+my.winner.election.cl$errors=
+  (my.winner.election.cl$candidate==my.winner.election.cl$prediction)
+```
+
+Visualizing the error maps
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+my.winner.counties <-
+  left_join(counties,my.winner.election.cl[c("fips","errors")],by="fips")
+
+ggplot(data = my.winner.counties) +
+  geom_polygon(aes(x = long, y = lat, fill = errors, group = group),
+               color = "white")+coord_fixed(1.3)+guides(fill=FALSE)+labs(title="prediction errors of glmnet on each county")
+```
+
+Green is right and red is wrong prediction. We see a bunch of misses on the North east, a couple on California coast, and a bunch in states to the west of Central US like Colorado, New Mexico and Arizona; almost all of which are also purple counties per the real data: https://www.nytimes.com/elections/2016/results/president. 
+
+Insights gained:
+The insights gained from each of the models have been discussed already in their analysis. Some of the other classifiers used in the further exploration part give better results but their improvement is due to a slightly more accurate learning of the interaction between variables and winner results.
+
+Possible Directions:
+One of the surprises of 2016 election was the fall of the so-called Blue Wall: https://en.wikipedia.org/wiki/Blue_wall_(politics)#Demise_of_the_blue_wall; The states Pennsylvania, Michigan and Wisconsin went to Trump which was not predicted by most models including FiveThirtyEight. Our model seems to predict well in those states with some misses, but it is important to emphasize  that Clinton lost Wisconsin by about 20,000, Pennsylvania by about 50,000 and Michigan by about 10,000. And if Hillary hadn't lost these states, she would have been the winner with 273 electoral votes.
+
+
+This means that even with having all the post-election data, we may not have been able to predict these states correctly because of the few misses we had or because if we were to predict the total votes then we would have **underestimated** Trump's performance in rural parts that were even correctly predicted to go to him. It is therefore important to see what the models do at determining the **nunber** of votes but also how they do at state level. This will be part of the __Further Exploration__ below.
+
+It is of course the case that additional data could help reduce the errors. Also trying to find out similar occurences in previous presidential elections and considering their data could be of help. One could also try a separate analysis of the three decisive states which Hillary lost narrowly. One of the theories behind her lost is due to the trade deal NAFTA (signed during her husband Bill Clinton presidency) which resulted in many jobs being shipped out of those states. Therefore, we could also test this theory by having additional data on the history of the workers in those states. If this theory stands, it would not be surprising to see high percentage of White blue-collar workers (i.e. employed in jobs like Production/Construction but not Professional/Office/Service) now being unemployed or employed in lower paying service jobs; and exit polls would then illustrate whether those people had a major turnout and voted for Trump.
+
+
+#FURTHER EXPLORATION:
+
+We build a new continuous prediction column (given by the response vector of the decision tree model) to get the purple counties predicted by the LASSO model (they should overlap to some extent with the misses found in the previous visualization).
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+my.election.restricted.cl$prediction.cts=0
+# train.tree.error.response <- predict(pruned.trn.cl,type="vector")
+my.election.restricted.cl$prediction.cts[in.trn]=train.glmnet.error.response
+my.election.restricted.cl$prediction.cts[-in.trn]=test.glmnet.error.response
+```
+
+Visualizing the continuous predictions to find out purple counties:
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+my.counties.cts <- left_join(counties,my.election.restricted.cl[c("fips","prediction.cts")],by="fips")
+library(munsell)
+cl <- mnsl(c("5R 7/10", "5B 7/8"))
+ggplot(data = my.counties.cts) +
+  geom_polygon(aes(x = long, y = lat, fill = prediction.cts, group = group), color = "white") +
+  coord_fixed(1.3) +scale_fill_gradient(low = cl[1],high = cl[2])+
+  guides(fill=FALSE)+labs(title="LASSO predictions on county winner")
+```
+
+
+The above is the prediction map. The more blue it is the more certain the LASSO model is about Hillary Clinton success. The more red the more certain it is for Trump. Interestingly, the purple counties mostly seem to appear in states that were not marginally won like those in the Blue Wall states, telling us more about the necessity of an analysis at the state level. 
+
+To get the purple counties, we determine an interval of $0.1$ around the threshold $0.5$
+
+```{r, cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+purple.counties <- my.election.restricted.cl[(my.election.restricted.cl$prediction.cts<0.60),]
+purple.counties <- purple.counties[(purple.counties$prediction.cts>0.40),]
+
+kable(nrow(purple.counties),col.names = "number of purple counties", "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+
+------------------------
+
+#1- Data preprocessing
+
+Data preprocessing: we aggregated sub-county level data before performing classification. Would classification at the sub-county level before determining the winner perform better? What implicit assumptions are we making?
+
+__ANSWER__: It could be that in certain subcounties of a county the voting turnout is higher than other subcounties with similar citizen populations, while they vote differently (for example consider a suburban area far away from the downtown and the downtown itself). What we are assuming here is that as counties are relatively small areas of populations, such variances should not be really high and people voting behavior should be similar. Therefore the aggregation which is done by the weighting by population should be enough and we don't need a more sophisticated weighting which comes from a measure of voting behavior (hence voting impact) beyond just the citizen population in each subcounty.
+
+So there might be some potential in a better model if analysis is performed at a subcounty level. But this performance gain may not be that high to warrant a more involved and time consuming data analysis.
+
+But in the end, in order to be really sure, we have to either perform the analysis or a more involved direction would be to analyze the variance of voting turnout in many elections in subcounties of each county and do the weighting according to the voting turnout.
+
+-----------------------
+
+#2- Analysis of the county and state vote
+
+Here we use dataframes we built for the main three candidates at county and state level to predict the number of votes using `lm`. We will then visualize the results and compare them to the actual results.
+
+```{r, cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+my.training.cl <- select(my.trn.cl,-c("county","fips","state"))
+my.lm_out1.cl <- 
+  lm(`Donald Trump` ~ . , data=select(my.training.cl,-`Hillary Clinton`,-`Gary Johnson`))
+my.lm_out2.cl <- 
+  lm(`Hillary Clinton` ~ . , data=select(my.training.cl,-`Donald Trump`,-`Gary Johnson`))
+my.lm_out3.cl <- 
+  lm(`Gary Johnson` ~ . , data=select(my.training.cl,-`Donald Trump`,-`Hillary Clinton`))
+```
+
+We print their summaries.
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(xtable(summary(my.lm_out1.cl)) ,caption = "Donald Trump","html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(xtable(summary(my.lm_out3.cl)) ,caption="Hillary Clinton","html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(xtable(summary(my.lm_out3.cl)), caption="Gary Johnson","html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+We do the same thing at the state level; notice here we will use the full data as we don't have many observations.
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+my.training.sl <- select(my.election.restricted.sl,-c("fips","state"))
+my.lm_out1.sl <- 
+  lm(`Donald Trump` ~ . , data=select(my.training.sl,-`Hillary Clinton`,-`Gary Johnson`))
+my.lm_out2.sl <- 
+  lm(`Hillary Clinton` ~ . , data=select(my.training.sl,-`Donald Trump`,-`Gary Johnson`))
+my.lm_out3.sl <- 
+  lm(`Gary Johnson` ~ . , data=select(my.training.sl,-`Donald Trump`,-`Hillary Clinton`))
+```
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(xtable(summary(my.lm_out1.sl)) ,caption = "Donald Trump","html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(xtable(summary(my.lm_out2.sl)) ,caption = "Hillary Clinton","html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(xtable(summary(my.lm_out3.sl)) ,caption = "Gary Johnson","html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(height = "300px")
+```
+
+In the case of counties, we see similar patterns of significant coefficients repeating themselves with `Men`, `Income`, `Transit`, `Minority` being among the significant coefficients as we saw in the previous classification models. One can also observe some variance as to which coefficients are significant among the candidates. 
+
+But when it comes to states, perhaps due to low number of states compared to the variables we have, we don't have many significant coefficients and there are a lot of uncertainty. We obtain significance mostly on the population of the total number of votes and sometimes `ChildPoverty`. An alternative direction is to perform a direct prediction of the states by applying our counties model at the state level (which has been trained with far more observations); we will have to change the `StateTotal` variable to `CountyTotal`. This is akin to thinking of states as huge counties. 
+
+But the problem with this idea is that the coefficients should become much larger as we can see by comparing the coefficients of the lm at each county and state level above.
+
+Let us see how the linear models do at the state level for the Blue Wall states:
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+bwpsl <- (predict(my.lm_out1.sl) - predict(my.lm_out2.sl))[my.election.restricted.sl$state %in%  c("Pennsylvania","Michigan","Wisconsin")]
+
+kable(c("Pennsylvania"=bwpsl[[1]],"Michigan"=bwpsl[[2]],"Wisconsin"=bwpsl[[3]]),"html",col.names = "(Trump - Hillary) votes") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+The model predicts Trump losing in two of these states but winning in one of them (Wisconsin). The margin by which he wins in Wisconsin is close to 20,000 which is about the margin by which he actually won. 
+
+Let us now apply the lm at county level on the state data just to check whether it fails badly or not due to improper scaling:
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+dummy.my.training.sl <- my.training.sl
+colnames(dummy.my.training.sl)[colnames(dummy.my.training.sl)=="StateTotal"]="CountyTotal"
+
+bwpslcl <- (predict(my.lm_out1.cl,dummy.my.training.sl) -
+    predict(my.lm_out2.cl,dummy.my.training.sl))[my.election.restricted.sl$state %in%
+                                                   c("Pennsylvania","Michigan","Wisconsin")] 
+kable(c("Pennsylvania"=bwpslcl[[1]],"Michigan"=bwpslcl[[2]],"Wisconsin"=bwpslcl[[3]]),"html",col.names = "(Trump - Hillary) votes") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+The model does fail badly and if provided with a naive scaling it would still predict all incorrectly but not by a high margin: Let us take the naive scaling of 60 (approximately equal to (number of counties)/(number of states) which is on __average__ the number that **makes a county become a state** in all variables). Then the model predicts losing by a small margin of 25 to 7 thousands. Hence even if we are not performing a sophisticated scaling,  we see that the model says that these are really purple states and not a __Blue__ **Wall**.
+
+In general, linear models are pretty efficient and easy estimator to start with. Also the most important thing in an election is the number of votes which lms can predict directly. Glm can predict indirectly by multiplying the probability of winning of each county by the TotalVotes in that county. But overall, lm's must be complemented with other classifiers. For example a data analyst of the presidential campaign must use glm to know better how the odds of winning change based on a unit change in the variables. The tree model also gives an overview of how to perhaps strategize campaigning as it provides a certain hierarchy of importance for variables. 
+
+---------------------
+
+#3- Exploring other classifiers
+
+__LDA AND QDA__
+
+We predict the candidate using lda and qda on the same election data that we used for previous classifiers. 
+
+```{r , cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+lda_out <- MASS::lda(candidate~.,data=election.cl,CV=TRUE)
+# The first county is Los Angeles with posterior probability NaN for both candidates.
+lda_out$posterior[1,]=c(0,1)
+election.cl.candidate=ifelse(election.cl$candidate=="Hillary Clinton",0,1) 
+pred.lda <- prediction(lda_out$posterior[,1],election.cl.candidate)
+perf.lda <- performance(pred.lda, "tpr", "fpr")
+lda.trn.error.rate <-
+    calc_error_rate(ifelse(lda_out$posterior[,2]>0.5,"Hillary Clinton",
+                           "Donald Trump")[in.trn],trn.cl$candidate)
+lda.tst.error.rate <-
+    calc_error_rate(ifelse(lda_out$posterior[,2]>0.5,"Hillary Clinton",
+                           "Donald Trump")[-in.trn],tst.cl$candidate)
+#QDA fit
+qda.cl=election.cl
+qda.cl$candidate=factor(qda.cl$candidate,c("Hillary Clinton","Donald Trump"))
+qda_out <- MASS::qda(candidate~.,data=qda.cl,CV=TRUE)
+election.cl.candidate=ifelse(election.cl$candidate=="Hillary Clinton",0,1) 
+pred.qda <- prediction(qda_out$posterior[,2],election.cl.candidate)
+perf.qda <- performance(pred.qda, "tpr", "fpr")
+qda.trn.error.rate <-
+    calc_error_rate(ifelse(qda_out$posterior[,1]>0.5,"Hillary Clinton",
+                           "Donald Trump")[in.trn],trn.cl$candidate)
+qda.tst.error.rate <-
+    calc_error_rate(ifelse(qda_out$posterior[,1]>0.5,"Hillary Clinton",
+                           "Donald Trump")[-in.trn],tst.cl$candidate)
+```
+
+Here is the ROC plot:
+
+```{r , cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+colorsmodels <- c('red', 'blue')
+plot(perf.qda,col=colorsmodels[1])
+plot(perf.lda, add = TRUE,col=colorsmodels[2])
+legend("bottom", 
+  legend = c("lda", "qda"),col = colorsmodels,inset = c(0.1, 0.1),bty = "n",pch = c(20,20))
+```
+
+Here is the plot with the threshold guide:
+
+```{r,  cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+#to see the threshold values p we add colorize
+plot(perf.qda,colorize=TRUE)
+plot(perf.lda,add=TRUE,colorize=TRUE)
+```
+
+The AUC values are:
+
+```{r , cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+auc.lda.tmp <- performance(pred.lda,"auc")
+auc.lda <- as.numeric(auc.lda.tmp@y.values)
+auc.qda.tmp <- performance(pred.qda,"auc")
+auc.qda <- as.numeric(auc.qda.tmp@y.values)
+kable(c("tree"=auc.tree,"glm"=auc.glm,"LASSO"=auc.glmnet,"LDA"=auc.lda,"QDA"=auc.qda),col.names ="AUC values", "html")%>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+LDA is higher in AUC than QDA and both sit between tree and other regression models. The error rate are not __exactly__ comparable as they are trained on different datasets for our classifiers: tree,glm,glmnet were trained on training part while lda and qda trained on the whole data (the full data) as we wanted to do LOOCV. Still, the train and test errors below are evaluated on the train and test dataset and stored in a `new_records` matrix which will be filled with the prediction of other models.
+
+```{r, cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+new_records= matrix(NA, nrow=8, ncol=2)
+colnames(new_records) = c("train.error","test.error")
+rownames(new_records) =
+  c("tree","logistic","lasso","LDA","QDA","SVM","TUNE.SVM","SVM_on_PC")
+new_records[1:3,]=records
+new_records[4,]=c(lda.trn.error.rate,lda.tst.error.rate)
+new_records[5,]=c(qda.trn.error.rate,qda.tst.error.rate)
+
+kable(new_records, "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+which shows that qda is definitely performing worst of all methods so far. LDA is about as good as logistic. Let us perform a visualization of lda:
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+my.winner.election.cl$prediction.cts=lda_out$posterior[,2]
+my.winner.counties.cts <-
+  left_join(counties,my.winner.election.cl[c("fips","prediction.cts")],by="fips")
+library(munsell)
+cl <- mnsl(c("5R 7/10", "5B 7/8"))
+ggplot(data = my.winner.counties.cts) +
+  geom_polygon(aes(x = long, y = lat, fill = prediction.cts, group = group), 
+               color = "white")+coord_fixed(1.3)+ 
+  scale_fill_gradient(low = cl[1],high = cl[2])+guides(fill=FALSE)+labs(title="lda prediction on county winner")
+```
+
+Let us count the number of purple counties with the threshold $0.4$ to $0.6$:
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(sum((lda_out$posterior[,2]<0.6) * (lda_out$posterior[,2]>0.4)),col.names = "number of purple counties", "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+This is smaller than $120$ for the same thresholds for glmnet. So there 
+is less uncertainty than glmnet.
+
+__SVM__
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+library(e1071)
+```
+
+We will implement a cross validation of svm over grid values of `cost` and `gamma`. `tune.svm()` performs 10 fold cross validation on $10\times 10$ grids, therefore a $1000$ runs. This takes some time (about 30 minutes) so what we will also implement is one svm with a fixed chosen value of `gamma` and `cost`. We store the results in `new_records` and print them.
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+chosen_svm_out <- svm(candidate~.,trn.cl,gamma=0.01,cost=10)
+chosen.svm.pred.trn <- predict(chosen_svm_out)
+chosen.svm.pred.trn.error.rate <- calc_error_rate(chosen.svm.pred.trn,trn.cl$candidate)
+chosen.svm.pred.tst <- predict(chosen_svm_out, tst.cl)
+chosen.svm.pred.tst.error.rate <- calc_error_rate(chosen.svm.pred.tst,tst.cl$candidate)
+new_records[6,]=c(chosen.svm.pred.trn.error.rate,chosen.svm.pred.tst.error.rate)
+kable(new_records, "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+Therefore SVM performs the best by a considerable margin on the train set and also by about one percent better than tree model. Therefore, based on this metric, we should choose SVM for predictions.
+
+The reader is free to run the cross validation code for `tune.svm()`; it turns out that the train error and test error are $0.03460912$ and $0.06016260$, respectively. This is the lowest among all models. This error rate is achieved with best parameters values (which are `gamma=0.011`,	`cost=11`). 
+
+```{r eval=FALSE, message = FALSE, echo=FALSE, warning=FALSE}
+# WARNING: This takes about 30 minutes.
+tune_svm_out <-  
+  tune.svm(x= select(trn.cl,-candidate),y=trn.cl$candidate,foldid=folds,gamma =seq(.001, 0.1, by = .01),
+           cost = seq(1,100, by = 10))
+best_tune_svm_out <-
+  svm(candidate~.,trn.cl,gamma=tune_svm_out$best.parameters$gamma,
+      cost=tune_svm_out$best.parameters$cost)
+best.tune.svm.pred.trn <- predict(best_tune_svm_out)
+best.tune.svm.pred.tst <- predict(best_tune_svm_out, tst.cl)
+best.tune.svm.pred.trn.error.rate <-
+  calc_error_rate(best.tune.svm.pred.trn,trn.cl$candidate)
+best.tune.svm.pred.tst.error.rate <-
+  calc_error_rate(best.tune.svm.pred.tst,tst.cl$candidate)
+new_records[7,]=c(best.tune.svm.pred.trn.error.rate,best.tune.svm.pred.tst.error.rate)
+print(new_records)
+print(tune_svm_out$best.parameters)
+```
+
+---------------------
+
+#4- Conducting analysis on PC features
+
+We will run pca again but this time on the tidy data `election.cl` provided by the handout instead of the untidy `census.ct`. We then  apply the best classifier, namely, svm on these features and record the results.
+
+```{r, cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+cl.pca <- prcomp(election.cl %>% select(-candidate), scale = TRUE, center = TRUE)
+cl.pca.var = cl.pca$sdev^2         #compute pca variance
+cl.pve <- cl.pca.var/sum(cl.pca.var)  #compute pve
+cl.cumulative_pve <- cumsum(cl.pve)#compute cumulative pve
+#find number of PCs to capture 90% of variance
+cl.pcfeatures.length=length(cl.cumulative_pve[cl.cumulative_pve<0.9])
+cl.pcfeatures=cl.pca$x[,seq(1,(cl.pcfeatures.length+1))]
+```
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+cl.pcfeatures=as.data.frame(cl.pcfeatures)
+cl.pcfeatures$candidate=election.cl$candidate
+cl.pcfeatures.trn=cl.pcfeatures[in.trn,]
+cl.pcfeatures.tst=cl.pcfeatures[-in.trn,]
+pc.chosen_svm_out <- svm(candidate~.,cl.pcfeatures.trn,gamma=0.01,cost=10)
+pc.chosen.svm.pred.trn <- predict(pc.chosen_svm_out)
+pc.chosen.svm.pred.trn.error.rate <-
+  calc_error_rate(pc.chosen.svm.pred.trn,cl.pcfeatures.trn$candidate)
+pc.chosen.svm.pred.tst <- predict(pc.chosen_svm_out,cl.pcfeatures.tst)
+pc.chosen.svm.pred.tst.error.rate <-
+  calc_error_rate(pc.chosen.svm.pred.tst,cl.pcfeatures.tst$candidate)
+new_records[8,]=c(pc.chosen.svm.pred.trn.error.rate,pc.chosen.svm.pred.tst.error.rate)
+```
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+#We input the results of tune.svm manually:
+new_records[7,]=c(0.03460912,0.06016260)
+```
+
+All results for all classifiers are as follows:
+
+```{r cache=TRUE, message = FALSE, echo=FALSE, warning=FALSE}
+kable(new_records, "html") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+Which shows a better performance achieved with less variables (14 instead of 26) than all the other classifiers tree,glm,glmnet,lda,qda at the train level and at the test level (with the exception of tree). therefore it is advisable to choose this instead of tree for prediction, but we have to be aware of intrepretability which is a strong point of tree in complete contrast to pc.
+
+------------------------
+
+#8 EDA of Purple Counties
+We conduct an exploratory analysis of the “purple” counties– the counties which the models predict Clinton and Trump were roughly equally likely to win. We want to know what is it about these counties that make them hard to predict?
+
+Our approach is to first perform descriptive statistics.
+
+__Data Wrangling__
+
+```{r, include=FALSE, echo=FALSE, message = FALSE}
+tmpwinner2 <- county_winner %>% ungroup %>%
+  mutate(state = state.name[match(state, state.abb)]) %>%               ## state abbreviations
+  mutate_at(vars(state, county), tolower) %>%                           ## to all lowercase
+  mutate(county = gsub(" county| columbia| city| parish", "", county))  ## remove suffixes
+tmpcensus2 <- ungroup(census.ct) %>% mutate_at(vars(State, County), tolower)
+
+my.election.cl <- tmpwinner2 %>%
+  left_join(tmpcensus2, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+my.election.cl$prediction.cts=0
+# train.tree.error.response <- predict(pruned.trn.cl,type="vector")
+my.election.cl$prediction.cts[in.trn]=train.glmnet.error.response
+my.election.cl$prediction.cts[-in.trn]=test.glmnet.error.response
+```
+
+```{r, cache=TRUE, include = FALSE}
+purple.counties <- my.election.cl[(my.election.cl$prediction.cts<0.60),]
+purple.counties <- purple.counties[(purple.counties$prediction.cts>0.40),]
+nrow(purple.counties)
+```
+
+```{r, echo=FALSE, message=FALSE, include=FALSE}
+#Make a dataset of the nonpurple counties for comparisons:
+nonpurple.counties <- my.election.cl[(my.election.cl$prediction.cts>0.60 | my.election.cl$prediction.cts<0.40),]
+
+#new datasets with the numeric information
+purple.counties.numerics <- select_if(purple.counties, is.numeric)
+nonpurple.counties.numerics <- select_if(nonpurple.counties, is.numeric)
+
+#Since there are many features we make some subdataframes with a selection of features.
+#The features I decide to include are "White", "Income", "Minority", "Unemployment", "Poverty"
+sub.purple.counties <- select(purple.counties, c("Income", "Minority", "Unemployment", "Poverty", "total", "Transit"))
+sub.nonpurple.counties <- select(nonpurple.counties, c("Income", "Minority", "Unemployment", "Poverty", "total", "Transit"))
+
+#new datasets with the numeric information for the subdata
+sub.purple.counties.numerics <- select_if(sub.purple.counties, is.numeric)
+sub.nonpurple.counties.numerics <- select_if(sub.nonpurple.counties, is.numeric)
+```
+
+__Descriptive Statistics__
+
+What states are the purple counties in?
+```{r, message=FALSE, echo=FALSE}
+tmp <- purple.counties %>% group_by(state) %>% summarise(n())
+kable(tmp, "html", col.names = c("State", "# of Purple Counties"), caption = "Count of Purple Counties for each State")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+
+```
+
+How did the purple counties vote?
+```{r, message=FALSE, echo=FALSE}
+tmp <- purple.counties %>% count(candidate)
+kable(tmp, "html", col.names = c("Candidate", "Purple County Wins"), caption = "Count of Purple County Wins")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+
+How did the nonpurple counties vote?
+```{r, message=FALSE, echo=FALSE}
+tmp <- nonpurple.counties %>% count(candidate)
+kable(tmp, "html", col.names = c("Candidate", "Nonpurple County Wins"), caption = "Count of Nonpurple County Wins")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+We observe that Trump overwhelmingly wins the nonpurple counties, but the purple counties are fairly even.
+
+Basic statistics of the purple and nonpurple counties:
+```{r, message=FALSE, echo=FALSE}
+#list of functions for descriptive statistics.
+funs <- function(x){c(Mean=mean(x),Var=var(x),Median=median(x),MAD=mad(x))}
+#compute descriptive statistics of purple counties
+tmp <- purple.counties.numerics %>% sapply(funs)
+kable(tmp, "html", caption = "Basic stats of purple counties")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+#compute descriptive statistics of nonpurple counties
+tmp <- nonpurple.counties.numerics %>% sapply(funs)
+kable(tmp, "html", caption = "Basic stats of nonpurple counties")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+
+The noticible differences are:
+
+  Purple counties have more income than nonpurple counties.
+  Purple counties have much more minorities than nonpurple counties.
+  Purple counties have slightly more unemployment and poverty than nonpurple counties.
+  Differences with transit.
+
+We used these ideas to select features for `sub.purple.counties` and `sub.nonpurple.counties`
+
+# Prior Distribution Boxplots
+
+We can construct prior distribution boxplots for various variables for each candidate.  Most features were found to have roughly the same distribution for each candidate, except for the feature 'Minority'. 
+```{r, message=FALSE, echo=FALSE}
+#prior distribution boxplots for purple counties
+ggplot(data = purple.counties) +
+    geom_boxplot(aes(x=candidate, y = Minority)) +
+    labs(title="Prior distribution of Minority in Purple Counties",
+        x ="Candidate", y = "Minority")
+
+#prior distribution boxplots for nonpurple
+ggplot(data = nonpurple.counties) +
+    geom_boxplot(aes(x=candidate, y = Minority)) +
+    labs(title="Prior distribution of Minority in Nonpurple Counties",
+        x ="Candidate", y = "Minority")
+```
+
+
+
+__Analysis__
+In a nonpurple county, if it went to Clinton then it had a larger proportion of minorities than if it went to Trump.
+In a purple county, if it went to Clinton then there is more variance in minorities if it went to Clinton, but the interquartile measurements for both candidates are more similar, with a tighter range for Trump than Clinton.
+
+
+
+
+
+
+
+
+# Scatterplots
+We now turn to construction of scatterplots.  Points represent counties.  They are colored according to winning candidate and sized according to total votes cast in the county.
+
+```{r, message=FALSE, echo=FALSE}
+#example for scatterplot
+ggplot(data = purple.counties) +
+  geom_point(mapping = aes(x= Income, y = Minority, color = candidate, size = votes)) +
+    labs(title="Income vs Minority in Purple Counties")
+
+#example for scatterplot
+ggplot(data = nonpurple.counties) +
+  geom_point(mapping = aes(x= Income, y = Minority, color = candidate, size = votes)) +
+    labs(title="Income vs Minority in Nonpurple Counties")
+```
+
+
+
+__Analysis__
+
+In the nonpurple counties, there is a visible separation: counties with both low income and low minorities vote for Trump while higher income or higher minorities vote for Clinton.
+
+This separation is not visibe in the purple counties.
+
+
+
+
+
+
+```{r, message=FALSE, echo=FALSE}
+#example for scatterplot
+ggplot(data = purple.counties) +
+  geom_point(mapping = aes(x= Minority, y = Poverty, color = candidate, size = votes))  +
+    labs(title="Minority vs Poverty in Purple Counties")
+
+#example for scatterplot
+ggplot(data = nonpurple.counties) +
+  geom_point(mapping = aes(x= Minority, y = Poverty, color = candidate, size = votes)) +
+    labs(title="Minority vs Poverty in NonPurple Counties")
+```
+
+
+__Analysis__
+We see a separation in the nonpurple counties, lower in minorities vote for Trump and higher in minorities vote for Clinton, independent of poverty.  This separation is not visible in the purple counties.
+
+
+
+
+
+
+
+```{r, message=FALSE, echo=FALSE}
+#keep
+#example for scatterplot
+ggplot(data = purple.counties) +
+  geom_point(mapping = aes(x= Minority, y = total, color = candidate, size = votes)) +
+    labs(title="Minority vs total votes in Purple Counties")
+
+#example for scatterplot
+ggplot(data = nonpurple.counties) +
+  geom_point(mapping = aes(x= Minority, y = total, color = candidate, size = votes)) +
+    labs(title="Minority vs total votes in Nonpurple Counties")
+```
+
+
+__Analysis__
+We see in the nonpurple counties that lower minority and lower population goes to Trump while increasing population and minorities goes to Clinton.
+
+In the purple counties we can see a hint of a pattern.  Minority between 20 and 50 tend toward Trump with the others tending to Clinton.
+
+
+
+
+
+
+```{r, message=FALSE, echo=FALSE}
+#example for scatterplot
+ggplot(data = purple.counties) +
+  geom_point(mapping = aes(x= Unemployment, y = total, color = candidate, size = votes)) +
+    labs(title="Unemployment vs total votes in Purple Counties")
+
+#example for scatterplot
+ggplot(data = nonpurple.counties) +
+  geom_point(mapping = aes(x= Unemployment, y = total, color = candidate, size = votes)) +
+    labs(title="Unemployment vs total votes in Nonpurple Counties")
+```
+
+
+__Analysis__
+
+In the nonpurple counties, low total votes tends to Trump, except more unemployment goes to Clinton.  As total votes increase the county is more likely to go to Clinton.
+
+This pattern does not hold in the purple counties.
+
+
+
+
+
+
+```{r, message=FALSE, echo=FALSE}
+#example for scatterplot
+ggplot(data = purple.counties) +
+  geom_point(mapping = aes(x= Transit, y = total, color = candidate, size = votes)) +
+    labs(title="Transit vs total votes in Purple Counties")
+
+#example for scatterplot
+ggplot(data = nonpurple.counties) +
+  geom_point(mapping = aes(x= Transit, y = total, color = candidate, size = votes)) +
+    labs(title="Transit vs total votes in Nonpurple Counties")
+```
+
+
+__Analysis__
+
+In the nonpurple counties, low transit and low votes goes to Trump.  The separation does not hld in the purple counties.
+
+
+
+
+
+
+```{r, message=FALSE, echo=FALSE}
+#example for scatterplot
+ggplot(data = purple.counties) +
+  geom_point(mapping = aes(x= Transit, y = Income, color = candidate, size = votes)) +
+    labs(title="Transit vs Income in Purple Counties")
+
+#example for scatterplot
+ggplot(data = nonpurple.counties) +
+  geom_point(mapping = aes(x= Transit, y = Income, color = candidate, size = votes)) +
+    labs(title="Transit vs Income in Nonpurple Counties")
+```
+
+
+__Analysis__
+
+We see in the nonpurple counties that increasing transit means the county probably goes to Clinton regardless of income.  There is no apparant pattern for the purple counties.
+
+
+
+
+
+#Correlation Detection
+
+```{r, message=FALSE, echo=FALSE}
+corrgram(sub.purple.counties, order=TRUE, lower.panel=panel.shade,
+	upper.panel=panel.pie, text.panel=panel.txt,
+	main="Purple Counties Corrgram")
+```
+
+```{r, message=FALSE, echo=FALSE}
+corrgram(sub.nonpurple.counties, order=TRUE, lower.panel=panel.shade,
+	upper.panel=panel.pie, text.panel=panel.txt,
+	main="Nonpurple Counties Corrgram")
+```
+
+
+__Analysis__
+
+* in purple counties there is a strong negative correlation between income and minority which is not present in the nonpurple counties.
+* in purple counties there is a stronger positive correlation between income and total votes than in nonpurple counties.
+* in nonpurple counties there is a slight positive correlation between minority and total votes but in purple counties there is a slight negative correlation between minority and total votes.
+* in purple counties transit has some negative correlation with unemployment, minority and poverty.  in nonpurple counties transit has some positive correlation with these variables.
+* in purple counties, total votes has negative correlation with unemployment, minority and poverty, with no strong correlation in the nonpurple counties.
+
+What do we think about this?  It is possible that the purple counties are rural counties with minorities.
+
+
