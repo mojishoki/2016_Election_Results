@@ -1,6 +1,6 @@
 ---
 title: "Final Project (PSTAT 231)"
-author: "Modjtaba Shokrian Zini (9398611), Glen Frost (8477861)"
+author: "Modjtaba Shokrian Zini, Glen Frost"
 date: "3/20/2019"
 output: html_document
 ---
