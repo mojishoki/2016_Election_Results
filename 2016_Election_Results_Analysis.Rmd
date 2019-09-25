@@ -14,15 +14,27 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r cache=TRUE, message = FALSE , echo=FALSE, warning=FALSE}
 # You might need to install the following packages.
-# install.packages('kableExtra')
-# install.packages('corrgram')
-# install.packages('xtable')
-library(xtable)
-library(kableExtra)
-library(corrgram)
+options(repos=structure(c(CRAN="http://cran.us.r-project.org")))
+install.packages('kableExtra')
+install.packages('corrgram')
+install.packages('xtable')
+install.packages('tidyverse')
+install.packages('ROCR')
+install.packages('tree')
+install.packages('maps')
+install.packages('maptree')
+install.packages('class')
+install.packages('lattice')
+install.packages('ggridges')
+install.packages('superheat')
+install.packages('glmnet')
+install.packages('e1071')
 ```
 
 ```{r cache=TRUE,message = FALSE , echo=FALSE, warning=FALSE}
+library(xtable)
+library(kableExtra)
+library(corrgram)
 library(tidyverse)
 library(ROCR)
 library(tree)
